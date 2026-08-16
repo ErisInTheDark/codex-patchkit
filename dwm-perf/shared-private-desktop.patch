@@ -1,8 +1,8 @@
 diff --git a/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs b/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs
-index bc8c4caddc8a09173839fc1548433a6f1c738523..f7010646bcc683b0471360c9e6e3372287ec54cf 100644
+index 41d1e5c8ca..a74137686a 100644
 --- a/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs
 +++ b/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs
-@@ -18,6 +18,7 @@ use codex_windows_sandbox::ErrorStage;
+@@ -20,6 +20,7 @@ use codex_windows_sandbox::ErrorStage;
  use codex_windows_sandbox::ExitPayload;
  use codex_windows_sandbox::FramedMessage;
  use codex_windows_sandbox::IPC_PROTOCOL_VERSION;
@@ -32,18 +32,18 @@ index bc8c4caddc8a09173839fc1548433a6f1c738523..f7010646bcc683b0471360c9e6e33722
 +            desktop_target,
              Some(log_dir.as_path()),
          )?;
-         hpc_handle = conpty.raw_handle();
-@@ -339,7 +347,7 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
-             &req.env,
-             stdin_mode,
-             StderrMode::Separate,
+         let job = conpty
+@@ -348,7 +356,7 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
+             } else {
+                 ConsoleMode::Inherit
+             },
 -            req.use_private_desktop,
 +            desktop_target,
              Some(log_dir.as_path()),
          )?;
          let pi = spawned_pipes.process;
 diff --git a/codex-rs/windows-sandbox-rs/src/conpty/mod.rs b/codex-rs/windows-sandbox-rs/src/conpty/mod.rs
-index 09dc52b572a7e9371d3af5e9b7778b1b920a0727..b2fed5d5c7e9a3a61e03d973fc390e547cddef79 100644
+index 475a6c0f54..eaf710e3ff 100644
 --- a/codex-rs/windows-sandbox-rs/src/conpty/mod.rs
 +++ b/codex-rs/windows-sandbox-rs/src/conpty/mod.rs
 @@ -7,6 +7,7 @@
@@ -54,7 +54,7 @@ index 09dc52b572a7e9371d3af5e9b7778b1b920a0727..b2fed5d5c7e9a3a61e03d973fc390e54
  use crate::proc_thread_attr::ProcThreadAttributeList;
  use crate::winutil::format_last_error;
  use crate::winutil::quote_windows_arg;
-@@ -96,7 +97,7 @@ pub fn spawn_conpty_process_as_user(
+@@ -106,7 +107,7 @@ pub fn spawn_conpty_process_as_user(
      argv: &[String],
      cwd: &Path,
      env_map: &HashMap<String, String>,
@@ -63,17 +63,17 @@ index 09dc52b572a7e9371d3af5e9b7778b1b920a0727..b2fed5d5c7e9a3a61e03d973fc390e54
      logs_base_dir: Option<&Path>,
  ) -> Result<(PROCESS_INFORMATION, ConptyInstance)> {
      let cmdline_str = argv
-@@ -112,7 +113,7 @@ pub fn spawn_conpty_process_as_user(
+@@ -122,7 +123,7 @@ pub fn spawn_conpty_process_as_user(
      si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
      si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
      si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
 -    let desktop = LaunchDesktop::prepare(use_private_desktop, logs_base_dir)?;
 +    let desktop = LaunchDesktop::prepare(desktop_target, logs_base_dir)?;
      si.StartupInfo.lpDesktop = desktop.startup_info_desktop();
+     let job = Arc::new(JobObject::create().context("create process job")?);
  
-     let raw = RawConPty::new(/*cols*/ 80, /*rows*/ 24)?;
 diff --git a/codex-rs/windows-sandbox-rs/src/desktop.rs b/codex-rs/windows-sandbox-rs/src/desktop.rs
-index 918278828dceee78c79819677b80eaf38c8f8d18..d1e674bfc61363d5409496f541f3ff11d2b96efd 100644
+index 918278828d..d1e674bfc6 100644
 --- a/codex-rs/windows-sandbox-rs/src/desktop.rs
 +++ b/codex-rs/windows-sandbox-rs/src/desktop.rs
 @@ -2,6 +2,7 @@ use crate::logging;
@@ -352,19 +352,19 @@ index 918278828dceee78c79819677b80eaf38c8f8d18..d1e674bfc61363d5409496f541f3ff11
      }
  }
 diff --git a/codex-rs/windows-sandbox-rs/src/elevated/ipc_framed.rs b/codex-rs/windows-sandbox-rs/src/elevated/ipc_framed.rs
-index fb99529f03e79b3ae8704336b1d988bfff97adde..da72841bdd6dae261193f6e39ca1727b14c42e58 100644
+index fca07f73c3..690dd53b4d 100644
 --- a/codex-rs/windows-sandbox-rs/src/elevated/ipc_framed.rs
 +++ b/codex-rs/windows-sandbox-rs/src/elevated/ipc_framed.rs
 @@ -26,7 +26,7 @@ use std::path::PathBuf;
  const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
  
  /// Protocol version shared by the parent process and elevated command runner.
--pub const IPC_PROTOCOL_VERSION: u8 = 4;
-+pub const IPC_PROTOCOL_VERSION: u8 = 5;
+-pub const IPC_PROTOCOL_VERSION: u8 = 5;
++pub const IPC_PROTOCOL_VERSION: u8 = 6;
  
  /// Length-prefixed, JSON-encoded frame.
  #[derive(Debug, Serialize, Deserialize, Clone)]
-@@ -71,6 +71,9 @@ pub struct SpawnRequest {
+@@ -74,6 +74,9 @@ pub struct SpawnRequest {
      pub stdin_open: bool,
      #[serde(default)]
      pub use_private_desktop: bool,
@@ -374,7 +374,7 @@ index fb99529f03e79b3ae8704336b1d988bfff97adde..da72841bdd6dae261193f6e39ca1727b
  }
  
  /// Ack from runner after it spawns the child process.
-@@ -228,6 +231,7 @@ mod tests {
+@@ -232,6 +235,7 @@ mod tests {
                      tty: false,
                      stdin_open: false,
                      use_private_desktop: false,
@@ -382,10 +382,10 @@ index fb99529f03e79b3ae8704336b1d988bfff97adde..da72841bdd6dae261193f6e39ca1727b
                  }),
              },
          };
-@@ -245,6 +249,10 @@ mod tests {
-         };
-         assert_eq!(PermissionProfile::read_only(), payload.permission_profile);
-         assert_eq!(workspace_roots, payload.workspace_roots);
+@@ -253,6 +257,10 @@ mod tests {
+             Some("S-1-5-21-100-200-300-400"),
+             payload.network_proxy_restricting_sid.as_deref()
+         );
 +        assert_eq!(
 +            Some("CodexSandboxDesktop-shared"),
 +            payload.private_desktop_name.as_deref()
@@ -394,7 +394,7 @@ index fb99529f03e79b3ae8704336b1d988bfff97adde..da72841bdd6dae261193f6e39ca1727b
  
      #[test]
 diff --git a/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs b/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs
-index 29fe0d7a0f12e2ecc8cfe73a14106bff824402aa..e040eeead33157ed944391cd3b739161ffeee578 100644
+index 90ad2dbc93..d40a491644 100644
 --- a/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs
 +++ b/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs
 @@ -1,3 +1,4 @@
@@ -402,7 +402,7 @@ index 29fe0d7a0f12e2ecc8cfe73a14106bff824402aa..e040eeead33157ed944391cd3b739161
  use crate::identity::SandboxCreds;
  use crate::ipc_framed::ErrorPayload;
  use crate::ipc_framed::ErrorStage;
-@@ -313,8 +314,16 @@ pub(crate) fn spawn_runner_transport(
+@@ -312,8 +313,16 @@ pub(crate) fn spawn_runner_transport(
      cwd: &Path,
      sandbox_creds: &SandboxCreds,
      log_dir: Option<&Path>,
@@ -421,10 +421,10 @@ index 29fe0d7a0f12e2ecc8cfe73a14106bff824402aa..e040eeead33157ed944391cd3b739161
      let h_pipe_in =
          create_named_pipe(&pipe_in_name, PIPE_ACCESS_OUTBOUND, &sandbox_creds.username)?;
 diff --git a/codex-rs/windows-sandbox-rs/src/elevated_impl.rs b/codex-rs/windows-sandbox-rs/src/elevated_impl.rs
-index 5475b9542e759ba5d3a7b41359a8f4026df697b1..3bfba88b2139bb3b2229303c1117d92e05e57919 100644
+index 1de7889c1f..ef1b429882 100644
 --- a/codex-rs/windows-sandbox-rs/src/elevated_impl.rs
 +++ b/codex-rs/windows-sandbox-rs/src/elevated_impl.rs
-@@ -194,6 +194,7 @@ mod windows_impl {
+@@ -197,6 +197,7 @@ mod windows_impl {
                  tty: false,
                  stdin_open: false,
                  use_private_desktop,
@@ -433,10 +433,10 @@ index 5475b9542e759ba5d3a7b41359a8f4026df697b1..3bfba88b2139bb3b2229303c1117d92e
              let transport = retry_runner_spawn_once(
                  sandbox_creds,
 diff --git a/codex-rs/windows-sandbox-rs/src/lib.rs b/codex-rs/windows-sandbox-rs/src/lib.rs
-index 2a394f11ffc564428d80a939bc75418875e394a1..a858a4991ad268809f2290adbdbe81991e14194f 100644
+index f86f1741ce..844d721ca9 100644
 --- a/codex-rs/windows-sandbox-rs/src/lib.rs
 +++ b/codex-rs/windows-sandbox-rs/src/lib.rs
-@@ -173,6 +173,8 @@ pub use deny_read_state::sync_persistent_deny_read_acls;
+@@ -177,6 +177,8 @@ pub use deny_read_state::sync_persistent_deny_read_acls;
  #[cfg(target_os = "windows")]
  pub use desktop::LaunchDesktop;
  #[cfg(target_os = "windows")]
@@ -445,15 +445,15 @@ index 2a394f11ffc564428d80a939bc75418875e394a1..a858a4991ad268809f2290adbdbe8199
  pub use dpapi::protect as dpapi_protect;
  #[cfg(target_os = "windows")]
  pub use dpapi::unprotect as dpapi_unprotect;
-@@ -350,6 +352,7 @@ pub use stub::run_windows_sandbox_legacy_preflight;
+@@ -356,6 +358,7 @@ pub use stub::run_windows_sandbox_legacy_preflight;
  #[cfg(target_os = "windows")]
  mod windows_impl {
      use super::WindowsSandboxCancellationToken;
 +    use super::desktop::LaunchDesktopTarget;
      use super::logging::log_failure;
+     use super::logging::log_note;
      use super::logging::log_success;
-     use super::process::create_process_as_user;
-@@ -562,6 +565,11 @@ mod windows_impl {
+@@ -571,6 +574,11 @@ mod windows_impl {
          let (stdin_pair, stdout_pair, stderr_pair) = unsafe { setup_stdio_pipes()? };
          let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) = (stdin_pair, stdout_pair, stderr_pair);
          let spawn_res = unsafe {
@@ -465,17 +465,17 @@ index 2a394f11ffc564428d80a939bc75418875e394a1..a858a4991ad268809f2290adbdbe8199
              create_process_as_user(
                  security.h_token,
                  &command,
-@@ -569,7 +577,7 @@ mod windows_impl {
-                 &env_map,
+@@ -579,7 +587,7 @@ mod windows_impl {
                  logs_base_dir,
                  Some((in_r, out_w, err_w)),
+                 ConsoleMode::Inherit,
 -                use_private_desktop,
 +                desktop_target,
              )
          };
          let created = match spawn_res {
 diff --git a/codex-rs/windows-sandbox-rs/src/process.rs b/codex-rs/windows-sandbox-rs/src/process.rs
-index 86859baf107dfbdbf88b44b55cf934eb91a947e4..e6c8c2710afc65313a53ee01998fec0be2963b99 100644
+index c2f873f0e1..6bb7c94d06 100644
 --- a/codex-rs/windows-sandbox-rs/src/process.rs
 +++ b/codex-rs/windows-sandbox-rs/src/process.rs
 @@ -1,4 +1,5 @@
@@ -484,10 +484,10 @@ index 86859baf107dfbdbf88b44b55cf934eb91a947e4..e6c8c2710afc65313a53ee01998fec0b
  use crate::logging;
  use crate::proc_thread_attr::ProcThreadAttributeList;
  use crate::winutil::argv_to_command_line;
-@@ -83,12 +84,12 @@ pub unsafe fn create_process_as_user(
-     env_map: &HashMap<String, String>,
+@@ -97,12 +98,12 @@ pub unsafe fn create_process_as_user(
      logs_base_dir: Option<&Path>,
      stdio: Option<(HANDLE, HANDLE, HANDLE)>,
+     console_mode: ConsoleMode,
 -    use_private_desktop: bool,
 +    desktop_target: LaunchDesktopTarget<'_>,
  ) -> Result<CreatedProcess> {
@@ -496,32 +496,32 @@ index 86859baf107dfbdbf88b44b55cf934eb91a947e4..e6c8c2710afc65313a53ee01998fec0b
      let env_block = make_env_block(env_map);
 -    let desktop = LaunchDesktop::prepare(use_private_desktop, logs_base_dir)?;
 +    let desktop = LaunchDesktop::prepare(desktop_target, logs_base_dir)?;
+     let job = Arc::new(JobObject::create().context("create process job")?);
      let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
      let cwd_wide = to_wide(cwd);
-     let env_block_len = env_block.len();
-@@ -232,7 +233,7 @@ pub fn spawn_process_with_pipes(
-     env_map: &HashMap<String, String>,
+@@ -229,7 +230,7 @@ pub fn spawn_process_with_pipes(
      stdin_mode: StdinMode,
      stderr_mode: StderrMode,
+     console_mode: ConsoleMode,
 -    use_private_desktop: bool,
 +    desktop_target: LaunchDesktopTarget<'_>,
      logs_base_dir: Option<&Path>,
  ) -> Result<PipeSpawnHandles> {
      let mut in_r: HANDLE = 0;
-@@ -275,7 +276,7 @@ pub fn spawn_process_with_pipes(
-             env_map,
+@@ -273,7 +274,7 @@ pub fn spawn_process_with_pipes(
              logs_base_dir,
              stdio,
+             console_mode,
 -            use_private_desktop,
 +            desktop_target,
          )
      };
      let created = match spawn_result {
 diff --git a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs
-index 7270fe6d607cf73bd82e77fb20af30f9ac1602d0..4191359dce84adcad8dfd3ce020240cf99ace96e 100644
+index 138b0be790..e9426ed843 100644
 --- a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs
 +++ b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs
-@@ -175,6 +175,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
+@@ -177,6 +177,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
              tty,
              stdin_open,
              use_private_desktop,
@@ -530,10 +530,10 @@ index 7270fe6d607cf73bd82e77fb20af30f9ac1602d0..4191359dce84adcad8dfd3ce020240cf
          read_roots_override: read_roots_override.map(<[PathBuf]>::to_vec),
          read_roots_include_platform_defaults,
 diff --git a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated_tests.rs b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated_tests.rs
-index 952727a21690b56ca800e0dee12339cadf101aa7..a2e3a18537048ffec4cba1fb45c9c6d38b86b695 100644
+index a5187eb15c..e8025109e0 100644
 --- a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated_tests.rs
 +++ b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated_tests.rs
-@@ -80,6 +80,7 @@ fn retry_uses_original_unified_exec_request_and_stops_after_second_failure() {
+@@ -81,6 +81,7 @@ fn retry_uses_original_unified_exec_request_and_stops_after_second_failure() {
              tty: true,
              stdin_open: true,
              use_private_desktop: true,
@@ -542,7 +542,7 @@ index 952727a21690b56ca800e0dee12339cadf101aa7..a2e3a18537048ffec4cba1fb45c9c6d3
          read_roots_override: Some(vec![PathBuf::from(r"C:\workspace\read")]),
          read_roots_include_platform_defaults: true,
 diff --git a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy.rs b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy.rs
-index f3c8ada8c97f35417727abe9990bd26b8fd41b84..564f8271eb8449d72695cfe6dc92a6004557e217 100644
+index bcbb4368c3..3217903e67 100644
 --- a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy.rs
 +++ b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy.rs
 @@ -2,6 +2,7 @@ use super::windows_common::finish_driver_spawn;
@@ -551,9 +551,9 @@ index f3c8ada8c97f35417727abe9990bd26b8fd41b84..564f8271eb8449d72695cfe6dc92a600
  use crate::desktop::LaunchDesktop;
 +use crate::desktop::LaunchDesktopTarget;
  use crate::logging::log_failure;
+ use crate::logging::log_note;
  use crate::logging::log_success;
- use crate::process::StderrMode;
-@@ -69,13 +70,18 @@ fn spawn_legacy_process(
+@@ -73,13 +74,18 @@ fn spawn_legacy_process(
      writer_rx: mpsc::Receiver<Vec<u8>>,
      logs_base_dir: Option<&Path>,
  ) -> Result<LegacyProcessHandles> {
@@ -562,7 +562,7 @@ index f3c8ada8c97f35417727abe9990bd26b8fd41b84..564f8271eb8449d72695cfe6dc92a600
 +    } else {
 +        LaunchDesktopTarget::Default
 +    };
-     let (pi, output_join, writer_handle, hpc, conpty_owner, desktop) = if tty {
+     let (pi, job, output_join, writer_handle, hpc, conpty_owner, desktop) = if tty {
          let (pi, mut conpty) = spawn_conpty_process_as_user(
              h_token,
              command,
@@ -572,11 +572,11 @@ index f3c8ada8c97f35417727abe9990bd26b8fd41b84..564f8271eb8449d72695cfe6dc92a600
 +            desktop_target,
              logs_base_dir,
          )?;
-         let hpc = conpty.raw_handle();
-@@ -98,7 +104,7 @@ fn spawn_legacy_process(
-                 StdinMode::Closed
+         let job = conpty
+@@ -106,7 +112,7 @@ fn spawn_legacy_process(
              },
              StderrMode::Separate,
+             ConsoleMode::Inherit,
 -            use_private_desktop,
 +            desktop_target,
              logs_base_dir,

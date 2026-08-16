@@ -1,3 +1,9 @@
 # Local PowerShell prototypes retained as uncommitted reference material.
 /*.ps1
 
+# Generated source worktrees, Cargo output, staged binaries, and backups.
+node_modules/
+/.work/
+/target/
+/dist/
+/backups/

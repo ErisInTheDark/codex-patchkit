@@ -1,0 +1,17 @@
+{
+  "name": "codex-patchkit",
+  "version": "0.147.0",
+  "private": true,
+  "description": "Build and install a pinned Codex release with local performance patches.",
+  "engines": {
+    "pnpm": ">=11.0.0 <12.0.0"
+  },
+  "scripts": {
+    "deps:fetch": "bash scripts/deps-fetch.sh",
+    "patches:check": "bash scripts/prepare-source.sh --check",
+    "build": "bash scripts/build.sh",
+    "package": "bash scripts/package.sh",
+    "install:built": "bash scripts/install.sh",
+    "codex:update": "bash scripts/update-codex.sh"
+  }
+}
