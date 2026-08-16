@@ -1,0 +1,584 @@
+diff --git a/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs b/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs
+index bc8c4caddc8a09173839fc1548433a6f1c738523..f7010646bcc683b0471360c9e6e3372287ec54cf 100644
+--- a/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs
++++ b/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs
+@@ -18,6 +18,7 @@ use codex_windows_sandbox::ErrorStage;
+ use codex_windows_sandbox::ExitPayload;
+ use codex_windows_sandbox::FramedMessage;
+ use codex_windows_sandbox::IPC_PROTOCOL_VERSION;
++use codex_windows_sandbox::LaunchDesktopTarget;
+ use codex_windows_sandbox::LocalSid;
+ use codex_windows_sandbox::Message;
+ use codex_windows_sandbox::OutputPayload;
+@@ -295,6 +296,13 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
+     }
+ 
+     let effective_cwd = effective_cwd(&req.cwd, Some(log_dir.as_path()));
++    let desktop_target = if !req.use_private_desktop {
++        LaunchDesktopTarget::Default
++    } else if let Some(name) = req.private_desktop_name.as_deref() {
++        LaunchDesktopTarget::NamedPrivate(name)
++    } else {
++        LaunchDesktopTarget::SharedPrivate
++    };
+ 
+     let mut conpty_owner = None;
+     let mut hpc_handle: Option<HANDLE> = None;
+@@ -305,7 +313,7 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
+             &req.command,
+             &effective_cwd,
+             &req.env,
+-            req.use_private_desktop,
++            desktop_target,
+             Some(log_dir.as_path()),
+         )?;
+         hpc_handle = conpty.raw_handle();
+@@ -339,7 +347,7 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
+             &req.env,
+             stdin_mode,
+             StderrMode::Separate,
+-            req.use_private_desktop,
++            desktop_target,
+             Some(log_dir.as_path()),
+         )?;
+         let pi = spawned_pipes.process;
+diff --git a/codex-rs/windows-sandbox-rs/src/conpty/mod.rs b/codex-rs/windows-sandbox-rs/src/conpty/mod.rs
+index 09dc52b572a7e9371d3af5e9b7778b1b920a0727..b2fed5d5c7e9a3a61e03d973fc390e547cddef79 100644
+--- a/codex-rs/windows-sandbox-rs/src/conpty/mod.rs
++++ b/codex-rs/windows-sandbox-rs/src/conpty/mod.rs
+@@ -7,6 +7,7 @@
+ //! Windows sandbox flows that need a PTY.
+ 
+ use crate::desktop::LaunchDesktop;
++use crate::desktop::LaunchDesktopTarget;
+ use crate::proc_thread_attr::ProcThreadAttributeList;
+ use crate::winutil::format_last_error;
+ use crate::winutil::quote_windows_arg;
+@@ -96,7 +97,7 @@ pub fn spawn_conpty_process_as_user(
+     argv: &[String],
+     cwd: &Path,
+     env_map: &HashMap<String, String>,
+-    use_private_desktop: bool,
++    desktop_target: LaunchDesktopTarget<'_>,
+     logs_base_dir: Option<&Path>,
+ ) -> Result<(PROCESS_INFORMATION, ConptyInstance)> {
+     let cmdline_str = argv
+@@ -112,7 +113,7 @@ pub fn spawn_conpty_process_as_user(
+     si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+     si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+     si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
+-    let desktop = LaunchDesktop::prepare(use_private_desktop, logs_base_dir)?;
++    let desktop = LaunchDesktop::prepare(desktop_target, logs_base_dir)?;
+     si.StartupInfo.lpDesktop = desktop.startup_info_desktop();
+ 
+     let raw = RawConPty::new(/*cols*/ 80, /*rows*/ 24)?;
+diff --git a/codex-rs/windows-sandbox-rs/src/desktop.rs b/codex-rs/windows-sandbox-rs/src/desktop.rs
+index 918278828dceee78c79819677b80eaf38c8f8d18..d1e674bfc61363d5409496f541f3ff11d2b96efd 100644
+--- a/codex-rs/windows-sandbox-rs/src/desktop.rs
++++ b/codex-rs/windows-sandbox-rs/src/desktop.rs
+@@ -2,6 +2,7 @@ use crate::logging;
+ use crate::token::get_current_token_for_restriction;
+ use crate::token::get_logon_sid_bytes;
+ use crate::winutil::format_last_error;
++use crate::winutil::resolve_sid;
+ use crate::winutil::to_wide;
+ use anyhow::Result;
+ use rand::Rng;
+@@ -10,6 +11,8 @@ use rand::rngs::SmallRng;
+ use std::ffi::c_void;
+ use std::path::Path;
+ use std::ptr;
++use std::sync::Mutex;
++use std::sync::OnceLock;
+ use windows_sys::Win32::Foundation::CloseHandle;
+ use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+ use windows_sys::Win32::Foundation::GetLastError;
+@@ -54,26 +57,34 @@ const DESKTOP_ALL_ACCESS: u32 = DESKTOP_READOBJECTS
+     | DESKTOP_WRITE_DAC
+     | DESKTOP_WRITE_OWNER;
+ 
++static SHARED_PRIVATE_DESKTOP: OnceLock<Mutex<Option<SharedPrivateDesktop>>> = OnceLock::new();
++
++/// Selects the desktop used by a sandboxed child process.
++#[derive(Clone, Copy, Debug)]
++pub enum LaunchDesktopTarget<'a> {
++    /// Use the user's visible desktop.
++    Default,
++    /// Use the private desktop owned by this long-lived Codex process.
++    SharedPrivate,
++    /// Use a private desktop whose lifetime is anchored by another process.
++    NamedPrivate(&'a str),
++}
++
+ pub struct LaunchDesktop {
+-    _private_desktop: Option<PrivateDesktop>,
+     startup_name: Vec<u16>,
+ }
+ 
+ impl LaunchDesktop {
+-    pub fn prepare(use_private_desktop: bool, logs_base_dir: Option<&Path>) -> Result<Self> {
+-        if use_private_desktop {
+-            let private_desktop = PrivateDesktop::create(logs_base_dir)?;
+-            let startup_name = to_wide(format!("Winsta0\\{}", private_desktop.name));
+-            Ok(Self {
+-                _private_desktop: Some(private_desktop),
+-                startup_name,
+-            })
+-        } else {
+-            Ok(Self {
+-                _private_desktop: None,
+-                startup_name: to_wide("Winsta0\\Default"),
+-            })
+-        }
++    pub fn prepare(target: LaunchDesktopTarget<'_>, logs_base_dir: Option<&Path>) -> Result<Self> {
++        let startup_name = match target {
++            LaunchDesktopTarget::Default => to_wide("Winsta0\\Default"),
++            LaunchDesktopTarget::SharedPrivate => to_wide(format!(
++                "Winsta0\\{}",
++                shared_private_desktop_name(None, logs_base_dir)?
++            )),
++            LaunchDesktopTarget::NamedPrivate(name) => to_wide(format!("Winsta0\\{name}")),
++        };
++        Ok(Self { startup_name })
+     }
+ 
+     pub fn startup_info_desktop(&self) -> *mut u16 {
+@@ -81,12 +92,15 @@ impl LaunchDesktop {
+     }
+ }
+ 
+-struct PrivateDesktop {
++struct SharedPrivateDesktop {
++    // The process intentionally keeps this handle open until exit so every command reuses the
++    // same desktop instead of forcing DWM to provision a new composition tree per launch.
+     handle: isize,
+     name: String,
++    trustee_sids: Vec<Vec<u8>>,
+ }
+ 
+-impl PrivateDesktop {
++impl SharedPrivateDesktop {
+     fn create(logs_base_dir: Option<&Path>) -> Result<Self> {
+         let mut rng = SmallRng::from_entropy();
+         let name = format!("CodexSandboxDesktop-{:x}", rng.r#gen::<u128>());
+@@ -114,42 +128,105 @@ impl PrivateDesktop {
+             return Err(anyhow::anyhow!("CreateDesktopW failed: {err}"));
+         }
+ 
+-        unsafe {
+-            if let Err(err) = grant_desktop_access(handle, logs_base_dir) {
+-                let _ = CloseDesktop(handle);
++        let trustee_sids = match current_logon_sid() {
++            Ok(logon_sid) => vec![logon_sid],
++            Err(err) => {
++                close_desktop_after_error(handle, logs_base_dir);
+                 return Err(err);
+             }
++        };
++        if let Err(err) = set_desktop_access(handle, &trustee_sids, logs_base_dir) {
++            close_desktop_after_error(handle, logs_base_dir);
++            return Err(err);
+         }
+ 
+-        Ok(Self { handle, name })
++        Ok(Self {
++            handle,
++            name,
++            trustee_sids,
++        })
++    }
++
++    fn grant_account_access(
++        &mut self,
++        account_name: &str,
++        logs_base_dir: Option<&Path>,
++    ) -> Result<()> {
++        // Elevated runners use a new logon session for each command, so their logon SID is not a
++        // stable trustee. The dedicated sandbox account SID is stable across those sessions.
++        let sid = resolve_sid(account_name)?;
++        if self.trustee_sids.contains(&sid) {
++            return Ok(());
++        }
++
++        let mut trustee_sids = self.trustee_sids.clone();
++        trustee_sids.push(sid);
++        set_desktop_access(self.handle, &trustee_sids, logs_base_dir)?;
++        self.trustee_sids = trustee_sids;
++        Ok(())
+     }
+ }
+ 
+-unsafe fn grant_desktop_access(handle: isize, logs_base_dir: Option<&Path>) -> Result<()> {
+-    let token = get_current_token_for_restriction()?;
+-    let mut logon_sid = get_logon_sid_bytes(token)?;
+-    CloseHandle(token);
+-
+-    let entries = [EXPLICIT_ACCESS_W {
+-        grfAccessPermissions: DESKTOP_ALL_ACCESS,
+-        grfAccessMode: GRANT_ACCESS,
+-        grfInheritance: 0,
+-        Trustee: TRUSTEE_W {
+-            pMultipleTrustee: ptr::null_mut(),
+-            MultipleTrusteeOperation: 0,
+-            TrusteeForm: TRUSTEE_IS_SID,
+-            TrusteeType: TRUSTEE_IS_UNKNOWN,
+-            ptstrName: logon_sid.as_mut_ptr() as *mut c_void as *mut u16,
+-        },
+-    }];
++pub(crate) fn shared_private_desktop_name(
++    sandbox_account: Option<&str>,
++    logs_base_dir: Option<&Path>,
++) -> Result<String> {
++    let desktop = SHARED_PRIVATE_DESKTOP.get_or_init(|| Mutex::new(None));
++    let mut desktop = desktop
++        .lock()
++        .map_err(|_| anyhow::anyhow!("shared private desktop mutex poisoned"))?;
++    if desktop.is_none() {
++        *desktop = Some(SharedPrivateDesktop::create(logs_base_dir)?);
++    }
++    let desktop = desktop
++        .as_mut()
++        .ok_or_else(|| anyhow::anyhow!("shared private desktop was not initialized"))?;
++    if let Some(sandbox_account) = sandbox_account {
++        desktop.grant_account_access(sandbox_account, logs_base_dir)?;
++    }
++    Ok(desktop.name.clone())
++}
++
++fn current_logon_sid() -> Result<Vec<u8>> {
++    let token = unsafe { get_current_token_for_restriction()? };
++    let sid = unsafe { get_logon_sid_bytes(token) };
++    unsafe {
++        CloseHandle(token);
++    }
++    sid
++}
++
++fn set_desktop_access(
++    handle: isize,
++    trustee_sids: &[Vec<u8>],
++    logs_base_dir: Option<&Path>,
++) -> Result<()> {
++    let mut trustee_sids = trustee_sids.to_vec();
++    let entries = trustee_sids
++        .iter_mut()
++        .map(|sid| EXPLICIT_ACCESS_W {
++            grfAccessPermissions: DESKTOP_ALL_ACCESS,
++            grfAccessMode: GRANT_ACCESS,
++            grfInheritance: 0,
++            Trustee: TRUSTEE_W {
++                pMultipleTrustee: ptr::null_mut(),
++                MultipleTrusteeOperation: 0,
++                TrusteeForm: TRUSTEE_IS_SID,
++                TrusteeType: TRUSTEE_IS_UNKNOWN,
++                ptstrName: sid.as_mut_ptr() as *mut c_void as *mut u16,
++            },
++        })
++        .collect::<Vec<_>>();
+ 
+     let mut updated_dacl = ptr::null_mut();
+-    let set_entries_code = SetEntriesInAclW(
+-        entries.len() as u32,
+-        entries.as_ptr(),
+-        ptr::null_mut(),
+-        &mut updated_dacl,
+-    );
++    let set_entries_code = unsafe {
++        SetEntriesInAclW(
++            entries.len() as u32,
++            entries.as_ptr(),
++            ptr::null_mut(),
++            &mut updated_dacl,
++        )
++    };
+     if set_entries_code != ERROR_SUCCESS {
+         logging::debug_log(
+             &format!("SetEntriesInAclW failed for private desktop: {set_entries_code}"),
+@@ -160,17 +237,21 @@ unsafe fn grant_desktop_access(handle: isize, logs_base_dir: Option<&Path>) -> R
+         ));
+     }
+ 
+-    let set_security_code = SetSecurityInfo(
+-        handle,
+-        SE_WINDOW_OBJECT,
+-        DACL_SECURITY_INFORMATION,
+-        ptr::null_mut(),
+-        ptr::null_mut(),
+-        updated_dacl,
+-        ptr::null_mut(),
+-    );
++    let set_security_code = unsafe {
++        SetSecurityInfo(
++            handle,
++            SE_WINDOW_OBJECT,
++            DACL_SECURITY_INFORMATION,
++            ptr::null_mut(),
++            ptr::null_mut(),
++            updated_dacl,
++            ptr::null_mut(),
++        )
++    };
+     if !updated_dacl.is_null() {
+-        LocalFree(updated_dacl as HLOCAL);
++        unsafe {
++            LocalFree(updated_dacl as HLOCAL);
++        }
+     }
+     if set_security_code != ERROR_SUCCESS {
+         logging::debug_log(
+@@ -185,12 +266,17 @@ unsafe fn grant_desktop_access(handle: isize, logs_base_dir: Option<&Path>) -> R
+     Ok(())
+ }
+ 
+-impl Drop for PrivateDesktop {
+-    fn drop(&mut self) {
+-        unsafe {
+-            if self.handle != 0 {
+-                let _ = CloseDesktop(self.handle);
+-            }
+-        }
++fn close_desktop_after_error(handle: isize, logs_base_dir: Option<&Path>) {
++    let closed = unsafe { CloseDesktop(handle) };
++    if closed == 0 {
++        let err = unsafe { GetLastError() } as i32;
++        logging::debug_log(
++            &format!(
++                "CloseDesktop failed after private desktop setup error: {} ({})",
++                err,
++                format_last_error(err),
++            ),
++            logs_base_dir,
++        );
+     }
+ }
+diff --git a/codex-rs/windows-sandbox-rs/src/elevated/ipc_framed.rs b/codex-rs/windows-sandbox-rs/src/elevated/ipc_framed.rs
+index fb99529f03e79b3ae8704336b1d988bfff97adde..da72841bdd6dae261193f6e39ca1727b14c42e58 100644
+--- a/codex-rs/windows-sandbox-rs/src/elevated/ipc_framed.rs
++++ b/codex-rs/windows-sandbox-rs/src/elevated/ipc_framed.rs
+@@ -26,7 +26,7 @@ use std::path::PathBuf;
+ const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
+ 
+ /// Protocol version shared by the parent process and elevated command runner.
+-pub const IPC_PROTOCOL_VERSION: u8 = 4;
++pub const IPC_PROTOCOL_VERSION: u8 = 5;
+ 
+ /// Length-prefixed, JSON-encoded frame.
+ #[derive(Debug, Serialize, Deserialize, Clone)]
+@@ -71,6 +71,9 @@ pub struct SpawnRequest {
+     pub stdin_open: bool,
+     #[serde(default)]
+     pub use_private_desktop: bool,
++    /// Names the parent-owned desktop that the short-lived runner must reuse.
++    #[serde(default)]
++    pub private_desktop_name: Option<String>,
+ }
+ 
+ /// Ack from runner after it spawns the child process.
+@@ -228,6 +231,7 @@ mod tests {
+                     tty: false,
+                     stdin_open: false,
+                     use_private_desktop: false,
++                    private_desktop_name: Some("CodexSandboxDesktop-shared".to_string()),
+                 }),
+             },
+         };
+@@ -245,6 +249,10 @@ mod tests {
+         };
+         assert_eq!(PermissionProfile::read_only(), payload.permission_profile);
+         assert_eq!(workspace_roots, payload.workspace_roots);
++        assert_eq!(
++            Some("CodexSandboxDesktop-shared"),
++            payload.private_desktop_name.as_deref()
++        );
+     }
+ 
+     #[test]
+diff --git a/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs b/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs
+index 29fe0d7a0f12e2ecc8cfe73a14106bff824402aa..e040eeead33157ed944391cd3b739161ffeee578 100644
+--- a/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs
++++ b/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs
+@@ -1,3 +1,4 @@
++use crate::desktop::shared_private_desktop_name;
+ use crate::identity::SandboxCreds;
+ use crate::ipc_framed::ErrorPayload;
+ use crate::ipc_framed::ErrorStage;
+@@ -313,8 +314,16 @@ pub(crate) fn spawn_runner_transport(
+     cwd: &Path,
+     sandbox_creds: &SandboxCreds,
+     log_dir: Option<&Path>,
+-    spawn_request: SpawnRequest,
++    mut spawn_request: SpawnRequest,
+ ) -> Result<RunnerTransport> {
++    spawn_request.private_desktop_name = if spawn_request.use_private_desktop {
++        Some(shared_private_desktop_name(
++            Some(&sandbox_creds.username),
++            log_dir,
++        )?)
++    } else {
++        None
++    };
+     let (pipe_in_name, pipe_out_name) = pipe_pair();
+     let h_pipe_in =
+         create_named_pipe(&pipe_in_name, PIPE_ACCESS_OUTBOUND, &sandbox_creds.username)?;
+diff --git a/codex-rs/windows-sandbox-rs/src/elevated_impl.rs b/codex-rs/windows-sandbox-rs/src/elevated_impl.rs
+index 5475b9542e759ba5d3a7b41359a8f4026df697b1..3bfba88b2139bb3b2229303c1117d92e05e57919 100644
+--- a/codex-rs/windows-sandbox-rs/src/elevated_impl.rs
++++ b/codex-rs/windows-sandbox-rs/src/elevated_impl.rs
+@@ -194,6 +194,7 @@ mod windows_impl {
+                 tty: false,
+                 stdin_open: false,
+                 use_private_desktop,
++                private_desktop_name: None,
+             };
+             let transport = retry_runner_spawn_once(
+                 sandbox_creds,
+diff --git a/codex-rs/windows-sandbox-rs/src/lib.rs b/codex-rs/windows-sandbox-rs/src/lib.rs
+index 2a394f11ffc564428d80a939bc75418875e394a1..a858a4991ad268809f2290adbdbe81991e14194f 100644
+--- a/codex-rs/windows-sandbox-rs/src/lib.rs
++++ b/codex-rs/windows-sandbox-rs/src/lib.rs
+@@ -173,6 +173,8 @@ pub use deny_read_state::sync_persistent_deny_read_acls;
+ #[cfg(target_os = "windows")]
+ pub use desktop::LaunchDesktop;
+ #[cfg(target_os = "windows")]
++pub use desktop::LaunchDesktopTarget;
++#[cfg(target_os = "windows")]
+ pub use dpapi::protect as dpapi_protect;
+ #[cfg(target_os = "windows")]
+ pub use dpapi::unprotect as dpapi_unprotect;
+@@ -350,6 +352,7 @@ pub use stub::run_windows_sandbox_legacy_preflight;
+ #[cfg(target_os = "windows")]
+ mod windows_impl {
+     use super::WindowsSandboxCancellationToken;
++    use super::desktop::LaunchDesktopTarget;
+     use super::logging::log_failure;
+     use super::logging::log_success;
+     use super::process::create_process_as_user;
+@@ -562,6 +565,11 @@ mod windows_impl {
+         let (stdin_pair, stdout_pair, stderr_pair) = unsafe { setup_stdio_pipes()? };
+         let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) = (stdin_pair, stdout_pair, stderr_pair);
+         let spawn_res = unsafe {
++            let desktop_target = if use_private_desktop {
++                LaunchDesktopTarget::SharedPrivate
++            } else {
++                LaunchDesktopTarget::Default
++            };
+             create_process_as_user(
+                 security.h_token,
+                 &command,
+@@ -569,7 +577,7 @@ mod windows_impl {
+                 &env_map,
+                 logs_base_dir,
+                 Some((in_r, out_w, err_w)),
+-                use_private_desktop,
++                desktop_target,
+             )
+         };
+         let created = match spawn_res {
+diff --git a/codex-rs/windows-sandbox-rs/src/process.rs b/codex-rs/windows-sandbox-rs/src/process.rs
+index 86859baf107dfbdbf88b44b55cf934eb91a947e4..e6c8c2710afc65313a53ee01998fec0be2963b99 100644
+--- a/codex-rs/windows-sandbox-rs/src/process.rs
++++ b/codex-rs/windows-sandbox-rs/src/process.rs
+@@ -1,4 +1,5 @@
+ use crate::desktop::LaunchDesktop;
++use crate::desktop::LaunchDesktopTarget;
+ use crate::logging;
+ use crate::proc_thread_attr::ProcThreadAttributeList;
+ use crate::winutil::argv_to_command_line;
+@@ -83,12 +84,12 @@ pub unsafe fn create_process_as_user(
+     env_map: &HashMap<String, String>,
+     logs_base_dir: Option<&Path>,
+     stdio: Option<(HANDLE, HANDLE, HANDLE)>,
+-    use_private_desktop: bool,
++    desktop_target: LaunchDesktopTarget<'_>,
+ ) -> Result<CreatedProcess> {
+     let cmdline_str = argv_to_command_line(argv);
+     let mut cmdline: Vec<u16> = to_wide(&cmdline_str);
+     let env_block = make_env_block(env_map);
+-    let desktop = LaunchDesktop::prepare(use_private_desktop, logs_base_dir)?;
++    let desktop = LaunchDesktop::prepare(desktop_target, logs_base_dir)?;
+     let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+     let cwd_wide = to_wide(cwd);
+     let env_block_len = env_block.len();
+@@ -232,7 +233,7 @@ pub fn spawn_process_with_pipes(
+     env_map: &HashMap<String, String>,
+     stdin_mode: StdinMode,
+     stderr_mode: StderrMode,
+-    use_private_desktop: bool,
++    desktop_target: LaunchDesktopTarget<'_>,
+     logs_base_dir: Option<&Path>,
+ ) -> Result<PipeSpawnHandles> {
+     let mut in_r: HANDLE = 0;
+@@ -275,7 +276,7 @@ pub fn spawn_process_with_pipes(
+             env_map,
+             logs_base_dir,
+             stdio,
+-            use_private_desktop,
++            desktop_target,
+         )
+     };
+     let created = match spawn_result {
+diff --git a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs
+index 7270fe6d607cf73bd82e77fb20af30f9ac1602d0..4191359dce84adcad8dfd3ce020240cf99ace96e 100644
+--- a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs
++++ b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs
+@@ -175,6 +175,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
+             tty,
+             stdin_open,
+             use_private_desktop,
++            private_desktop_name: None,
+         },
+         read_roots_override: read_roots_override.map(<[PathBuf]>::to_vec),
+         read_roots_include_platform_defaults,
+diff --git a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated_tests.rs b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated_tests.rs
+index 952727a21690b56ca800e0dee12339cadf101aa7..a2e3a18537048ffec4cba1fb45c9c6d38b86b695 100644
+--- a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated_tests.rs
++++ b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated_tests.rs
+@@ -80,6 +80,7 @@ fn retry_uses_original_unified_exec_request_and_stops_after_second_failure() {
+             tty: true,
+             stdin_open: true,
+             use_private_desktop: true,
++            private_desktop_name: None,
+         },
+         read_roots_override: Some(vec![PathBuf::from(r"C:\workspace\read")]),
+         read_roots_include_platform_defaults: true,
+diff --git a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy.rs b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy.rs
+index f3c8ada8c97f35417727abe9990bd26b8fd41b84..564f8271eb8449d72695cfe6dc92a6004557e217 100644
+--- a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy.rs
++++ b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy.rs
+@@ -2,6 +2,7 @@ use super::windows_common::finish_driver_spawn;
+ use crate::conpty::ConptyInstance;
+ use crate::conpty::spawn_conpty_process_as_user;
+ use crate::desktop::LaunchDesktop;
++use crate::desktop::LaunchDesktopTarget;
+ use crate::logging::log_failure;
+ use crate::logging::log_success;
+ use crate::process::StderrMode;
+@@ -69,13 +70,18 @@ fn spawn_legacy_process(
+     writer_rx: mpsc::Receiver<Vec<u8>>,
+     logs_base_dir: Option<&Path>,
+ ) -> Result<LegacyProcessHandles> {
++    let desktop_target = if use_private_desktop {
++        LaunchDesktopTarget::SharedPrivate
++    } else {
++        LaunchDesktopTarget::Default
++    };
+     let (pi, output_join, writer_handle, hpc, conpty_owner, desktop) = if tty {
+         let (pi, mut conpty) = spawn_conpty_process_as_user(
+             h_token,
+             command,
+             cwd,
+             env_map,
+-            use_private_desktop,
++            desktop_target,
+             logs_base_dir,
+         )?;
+         let hpc = conpty.raw_handle();
+@@ -98,7 +104,7 @@ fn spawn_legacy_process(
+                 StdinMode::Closed
+             },
+             StderrMode::Separate,
+-            use_private_desktop,
++            desktop_target,
+             logs_base_dir,
+         )?;
+         let stdout_join = spawn_output_reader(pipe_handles.stdout_read, stdout_tx);
