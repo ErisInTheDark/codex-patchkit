@@ -1,6 +1,6 @@
 # codex-patchkit ♡
 
-a tiny patch wand for building a pinned Codex release on Windows without poking the upstream source checkout (｡•̀ᴗ-)✧
+wave a tiny patch kit wand for building a pinned Codex release on Windows without poking the upstream source checkout (｡•̀ᴗ-)✧
 
 ## what's alive nyow
 
